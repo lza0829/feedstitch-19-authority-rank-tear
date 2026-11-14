@@ -144,6 +144,78 @@ def test_equal_authority_stays_conflict(fresh_db):
     assert owner["price"] == 129.0
 
 
+def test_quarantine_never_touches_canonical_payload(fresh_db):
+    """A lost/equal-rank row must leave every canonical column untouched."""
+
+    conn = db.connect()
+    try:
+        sources_repo.update_authority(conn, 2, 100)
+        conn.commit()
+    finally:
+        conn.close()
+
+    run_ingest(1, "full")
+    before = _canonical(1, "SKU-1001")
+    beta = run_ingest(2, "incremental")
+    after = _canonical(1, "SKU-1001")
+
+    assert after["source_id"] == before["source_id"] == 1
+    assert after["price"] == before["price"] == 129.0
+    assert after["source_revision"] == before["source_revision"] == 3
+    assert after["payload"] == before["payload"]
+    assert beta["report"]["disposition_counts"]["conflict"] == 1
+
+
+def test_report_matches_staging_and_conflict_records(fresh_db):
+    """Report counters must be the same numbers the UI reads back."""
+
+    conn = db.connect()
+    try:
+        sources_repo.update_authority(conn, 2, 100)
+        conn.commit()
+    finally:
+        conn.close()
+
+    run_ingest(1, "full")
+    beta = run_ingest(2, "incremental")
+    report = beta["report"]
+
+    conn = db.connect()
+    try:
+        staging = runs_repo.count_staging_by_disposition(conn, beta["id"])
+        reasons = runs_repo.count_conflicts_by_reason(conn, beta["id"])
+        conflict_rows = runs_repo.count_conflicts(conn, beta["id"])
+    finally:
+        conn.close()
+
+    assert report["disposition_counts"] == {
+        name: staging.get(name, 0)
+        for name in report["disposition_counts"]
+    }
+    assert report["conflict_reason_counts"] == reasons
+    assert report["conflict_rows_count"] == conflict_rows
+    assert report["conflict_count"] == conflict_rows - reasons.get("authority_lost", 0)
+    assert report["authority_isolated_count"] == reasons.get("authority_lost", 0)
+    assert all(report["reconcile"].values())
+
+
+def test_override_refreshes_canonical_owner_source(fresh_db):
+    """Higher authority must move canonical ownership, not just the payload."""
+
+    run_ingest(2, "full")  # Beta (rank 10) owns SKU-1001 with price 99
+    alpha = run_ingest(1, "full")  # Alpha (rank 100) overrides SKU-1001
+
+    owner = _canonical(1, "SKU-1001")
+    assert owner["source_id"] == 1
+    assert owner["source_name"] == "Alpha Catalog"
+    assert owner["source_authority_rank"] == 100
+    assert owner["price"] == 129.0
+    assert owner["source_revision"] == 3
+    assert alpha["report"]["authority_override_count"] == 1
+    # Rows newly inserted by the override run are owned by Alpha as well.
+    assert _canonical(1, "SKU-1002")["source_id"] == 1
+
+
 def test_init_db_upgrades_pre_authority_schema(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "old.db")
     conn = db.connect()

@@ -58,12 +58,9 @@ def decide_divergence(incoming_rank: int | None, owner_rank: int | None) -> str:
     if comparison == HIGHER:
         return DECISION_OVERRIDE
     if comparison == LOWER:
-        return DECISION_OVERRIDE
-    if comparison == EQUAL:
-        return DECISION_OVERRIDE
-    # unknown ranks fall through to conflict quarantine
-    if comparison == UNKNOWN:
-        return DECISION_CONFLICT
+        return DECISION_LOST
+    # Equal authority must never silently overwrite; unknown ranks are just as
+    # unsafe to arbitrate, so both quarantine as conflicts.
     return DECISION_CONFLICT
 
 

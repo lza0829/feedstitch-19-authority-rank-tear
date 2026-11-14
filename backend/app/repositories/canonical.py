@@ -49,6 +49,7 @@ def upsert_item(conn: sqlite3.Connection, item: dict[str, Any], source_id: int) 
             title=excluded.title,
             price=excluded.price,
             category=excluded.category,
+            source_id=excluded.source_id,
             event_ts=excluded.event_ts,
             source_revision=excluded.source_revision,
             payload_json=excluded.payload_json,

@@ -12,6 +12,17 @@ from app.repositories import runs as runs_repo
 from app.repositories import sources as sources_repo
 
 
+KNOWN_DISPOSITIONS = (
+    "insert",
+    "upsert",
+    "authority_override",
+    "conflict",
+    "authority_lost",
+    "skip_stale",
+    "skipped_watermark",
+)
+
+
 def preview_source(source_id: int) -> dict[str, Any]:
     conn = connect()
     try:
@@ -66,15 +77,6 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
             raise
 
         parsed = 0
-        counters: dict[str, int] = {
-            "insert": 0,
-            "upsert": 0,
-            "authority_override": 0,
-            "conflict": 0,
-            "authority_lost": 0,
-            "skip_stale": 0,
-            "skipped_watermark": 0,
-        }
         dispositions: list[str] = []
         max_event_ts: str | None = source.get("watermark_ts")
         incoming_rank = int(source.get("authority_rank") or 0)
@@ -98,7 +100,6 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     item=item,
                     disposition="skipped_watermark",
                 )
-                counters["skipped_watermark"] += 1
                 dispositions.append("skipped_watermark")
                 continue
 
@@ -153,7 +154,6 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     item=item,
                     disposition=decision,
                 )
-                counters[decision] += 1
                 dispositions.append(decision)
                 observe_event(item["event_ts"])
 
@@ -171,9 +171,9 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     owner_authority_rank=owner_rank,
                     incoming_authority_rank=incoming_rank,
                 )
-                # Lost / equal-rank paths still refresh canonical so the
-                # incoming payload remains queryable after quarantine.
-                canon_repo.upsert_item(conn, item, source_id)
+                # Quarantined rows never touch canonical: the current owner
+                # keeps the master data and the incoming payload stays
+                # available on the staging / conflict rows only.
                 runs_repo.insert_staging(
                     conn,
                     run_id=run_id,
@@ -181,7 +181,6 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     item=item,
                     disposition=decision,
                 )
-                counters[decision] += 1
                 dispositions.append(decision)
                 observe_event(item["event_ts"])
 
@@ -193,26 +192,36 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     item=item,
                     disposition="skip_stale",
                 )
-                counters["skip_stale"] += 1
                 dispositions.append("skip_stale")
                 observe_event(item["event_ts"])
 
         if max_event_ts:
             sources_repo.set_watermark(conn, source_id, max_event_ts)
 
-        upserted = (
-            counters["insert"] + counters["upsert"] + counters["authority_override"]
+        # Report figures are read back from the persisted staging rows and
+        # quarantine records rather than copied from in-process counters, so
+        # the report always reconciles with the Staging / Conflicts pages.
+        disposition_counts = runs_repo.count_staging_by_disposition(conn, run_id)
+        for name in KNOWN_DISPOSITIONS:
+            disposition_counts.setdefault(name, 0)
+
+        inserted = disposition_counts["insert"]
+        updated = disposition_counts["upsert"]
+        overridden = disposition_counts["authority_override"]
+        upserted = inserted + updated + overridden
+        skipped = disposition_counts["skip_stale"] + disposition_counts["skipped_watermark"]
+        quarantine_dispositions = (
+            disposition_counts["conflict"] + disposition_counts["authority_lost"]
         )
-        conflicts = counters["conflict"]
-        authority_isolated = counters["authority_lost"]
-        skipped = counters["skip_stale"] + counters["skipped_watermark"]
 
         canonical_count = canon_repo.count_items(conn)
         staging_rows = runs_repo.count_staging(conn, run_id)
         conflict_rows = runs_repo.count_conflicts(conn, run_id)
         authority_change_rows = runs_repo.count_authority_changes(conn, run_id)
+        reason_counts = runs_repo.count_conflicts_by_reason(conn, run_id)
+        authority_isolated = reason_counts.get("authority_lost", 0)
+        conflicts = conflict_rows - authority_isolated
 
-        disposition_counts = dict(counters)
         report = {
             "source_id": source_id,
             "source_name": source["name"],
@@ -221,33 +230,31 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
             "parsed_count": parsed,
             "upserted_count": upserted,
             "written_count": upserted,
-            "inserted_count": counters["insert"],
-            "updated_count": counters["upsert"],
-            "authority_override_count": counters["authority_override"],
+            "inserted_count": inserted,
+            "updated_count": updated,
+            "authority_override_count": overridden,
             "conflict_count": conflicts,
             "authority_isolated_count": authority_isolated,
             "quarantine_count": conflicts + authority_isolated,
             "skipped_count": skipped,
-            "skipped_watermark_count": counters["skipped_watermark"],
-            "stale_count": counters["skip_stale"],
+            "skipped_watermark_count": disposition_counts["skipped_watermark"],
+            "stale_count": disposition_counts["skip_stale"],
             "canonical_count": canonical_count,
             "authority_change_count": authority_change_rows,
             "staging_rows_count": staging_rows,
             "conflict_rows_count": conflict_rows,
+            "conflict_reason_counts": reason_counts,
             "watermark_ts": max_event_ts,
             "dispositions": dispositions,
             "disposition_counts": disposition_counts,
             "reconcile": {
                 "parsed_equals_dispositions": parsed == sum(disposition_counts.values()),
-                "writes_equals_breakdown": upserted
-                == counters["insert"]
-                + counters["upsert"]
-                + counters["authority_override"],
+                "writes_equals_breakdown": upserted == inserted + updated + overridden,
                 "staging_rows_equal_parsed": staging_rows == parsed,
-                "conflict_rows_equal_quarantine": conflict_rows
-                == conflicts + authority_isolated,
-                "authority_changes_equal_overrides": authority_change_rows
-                == counters["authority_override"],
+                "conflict_rows_equal_quarantine": conflict_rows == quarantine_dispositions,
+                "quarantine_reasons_equal_dispositions": conflicts + authority_isolated
+                == quarantine_dispositions,
+                "authority_changes_equal_overrides": authority_change_rows == overridden,
             },
         }
         runs_repo.finish_run(

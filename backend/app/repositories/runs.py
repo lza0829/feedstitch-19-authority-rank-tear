@@ -139,6 +139,30 @@ def count_staging(conn: sqlite3.Connection, run_id: int) -> int:
     )
 
 
+def count_staging_by_disposition(
+    conn: sqlite3.Connection, run_id: int
+) -> dict[str, int]:
+    rows = conn.execute(
+        """
+        SELECT disposition, COUNT(*) c FROM staging_rows
+        WHERE run_id = ? GROUP BY disposition
+        """,
+        (run_id,),
+    ).fetchall()
+    return {r["disposition"]: int(r["c"]) for r in rows}
+
+
+def count_conflicts_by_reason(conn: sqlite3.Connection, run_id: int) -> dict[str, int]:
+    rows = conn.execute(
+        """
+        SELECT reason, COUNT(*) c FROM conflicts
+        WHERE run_id = ? GROUP BY reason
+        """,
+        (run_id,),
+    ).fetchall()
+    return {r["reason"]: int(r["c"]) for r in rows}
+
+
 def insert_conflict(
     conn: sqlite3.Connection,
     *,
